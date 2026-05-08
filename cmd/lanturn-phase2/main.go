@@ -46,6 +46,7 @@ import (
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/logging"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/srtp/v3"
 	pionturn "github.com/pion/turn/v3"
@@ -100,7 +101,7 @@ func main() {
 		peer := fs.String("peer", "127.0.0.1:9999", "egress address")
 		fpMode := fs.String("fingerprint", "mimic", "DTLS ClientHello fingerprint mode: mimic | randomize | none")
 		sessionCount := fs.Int("sessions", 3, "number of back-to-back sessions to run")
-		sessionDur := fs.Duration("session-duration", 1*time.Second, "duration of each session (production target: 25-35 min)")
+		sessionDur := fs.Duration("session-duration", 6*time.Second, "duration of each session (production target: 25-35 min; 6s default lets DTX + RTCP cycles show up in spike)")
 		idleGapMin := fs.Duration("idle-gap-min", 200*time.Millisecond, "min idle gap between sessions (production target: 30s)")
 		idleGapMax := fs.Duration("idle-gap-max", 1*time.Second, "max idle gap between sessions (production target: 5min)")
 		retries := fs.Int("retries", 3, "DTLS handshake retries per session")
@@ -328,40 +329,9 @@ func runClientSession(server, secret string, peerIP net.IP, peerPort int, fpMode
 	ts := randUint32()
 	seq := uint16(randUint32() & 0xFFFF)
 
-	deadline := time.Now().Add(dur)
-	log.Printf("client: SRTP TX context ready (ssrc=%#x), streaming Opus-shaped packets for %s...", ssrc, dur)
-	pktCount := 0
-	for time.Now().Before(deadline) {
-		payloadLen := 100 + (int(randUint32()) % 80)
-		payload := make([]byte, payloadLen)
-		rand.Read(payload)
-		pkt := &rtp.Packet{
-			Header: rtp.Header{
-				Version:        2,
-				PayloadType:    opusPayloadType,
-				SequenceNumber: seq,
-				Timestamp:      ts,
-				SSRC:           ssrc,
-			},
-			Payload: payload,
-		}
-		raw, err := pkt.Marshal()
-		if err != nil {
-			return err
-		}
-		encrypted, err := txCtx.EncryptRTP(nil, raw, nil)
-		if err != nil {
-			return err
-		}
-		if _, err := mux.WriteSRTP(encrypted); err != nil {
-			return err
-		}
-		seq++
-		ts += uint32(opusFrameSamples)
-		pktCount++
-		time.Sleep(time.Duration(opusFrameMs) * time.Millisecond)
-	}
-	log.Printf("client: session sent %d SRTP packets in %s (~%.0f pps)", pktCount, dur, float64(pktCount)/dur.Seconds())
+	log.Printf("client: SRTP TX context ready (ssrc=%#x), streaming with jitter / DTX / RTCP-SR for %s...", ssrc, dur)
+	stats := streamWithMimicry(mux, txCtx, ssrc, &ts, &seq, dur)
+	log.Printf("client: session stats — %s", stats)
 
 	// Brief grace before tearing down so egress can drain. In a real
 	// production teardown the client would also send a Refresh with
@@ -464,23 +434,213 @@ func runEgressSession(pc net.PacketConn, demux *egressDemuxer, ev *sessionEvent)
 	log.Printf("egress: SRTP RX context ready, receiving packets until peer goes silent...")
 
 	rxBuf := make([]byte, 4096)
-	pktCount := 0
+	srtpCount, srtcpCount, decryptErrs := 0, 0, 0
 	for {
-		// 2-second silence threshold marks session end.
-		mux.srtpReadDeadline(time.Now().Add(2 * time.Second))
+		// 3-second silence threshold marks session end (DTX comfort
+		// noise emits at ~1pps so threshold must exceed 1s).
+		mux.srtpReadDeadline(time.Now().Add(3 * time.Second))
 		n, err := mux.ReadSRTP(rxBuf)
 		if err != nil {
 			break
 		}
-		_, err = rxCtx.DecryptRTP(nil, rxBuf[:n], nil)
-		if err != nil {
-			log.Printf("egress: decrypt err pkt %d: %v", pktCount, err)
+		// Distinguish RTP from RTCP by leading byte's PT field
+		// (RTCP packet types 200-204 occupy positions 200-204 in
+		// the second byte; the first byte's high bits are still 0b10).
+		// Cleanest: try RTP decrypt first; if it fails, try RTCP.
+		if _, err := rxCtx.DecryptRTP(nil, rxBuf[:n], nil); err != nil {
+			if _, err2 := rxCtx.DecryptRTCP(nil, rxBuf[:n], nil); err2 != nil {
+				decryptErrs++
+				continue
+			}
+			srtcpCount++
 			continue
 		}
-		pktCount++
+		srtpCount++
 	}
-	log.Printf("egress: session received %d SRTP packets", pktCount)
+	log.Printf("egress: session received srtp=%d srtcp=%d decrypt-errs=%d", srtpCount, srtcpCount, decryptErrs)
 	return nil
+}
+
+// ----------------------------------------------------------------------------
+// streamWithMimicry — pacing-fidelity layer (Phase 2c).
+//
+// Mimics the inter-packet timing distribution + DTX + RTCP cadence of a
+// real WebRTC Opus audio call. Specifically:
+//
+//   - Jitter envelope: each inter-packet sleep is base ± uniform(-1.5ms,
+//     +1.5ms). Real codec emit timing has microsecond-level non-uniformity
+//     a censor's behavioral classifier could match if absent.
+//   - DTX (discontinuous transmission): periodic state transitions
+//     between "active speech" (50pps, ~140B payload) and "quiet"
+//     (1pps comfort-noise, ~10B payload). State durations are 1-5s
+//     uniform; weighting is 70% active / 30% quiet for typical
+//     conversational speech.
+//   - RTCP Sender Reports interleaved every ~5s, encrypted as SRTCP and
+//     sent on the same channel. RTP/RTCP demux on the receiver routes
+//     by leading-byte; the egress drops them in this spike but a real
+//     egress would parse loss + RTT feedback.
+// ----------------------------------------------------------------------------
+
+type streamStats struct {
+	srtpSent      int
+	srtcpSent     int
+	bytesSent     uint64
+	stateChanges  int
+	activeFrac    float64
+	avgIPI        time.Duration
+	wallTime      time.Duration
+}
+
+func (s streamStats) String() string {
+	return fmt.Sprintf(
+		"srtp=%d srtcp=%d bytes=%d state-changes=%d active-frac=%.2f avg-ipi=%s wall=%s",
+		s.srtpSent, s.srtcpSent, s.bytesSent, s.stateChanges, s.activeFrac, s.avgIPI, s.wallTime,
+	)
+}
+
+type speechState int
+
+const (
+	speechActive speechState = iota
+	speechDTX
+)
+
+func streamWithMimicry(mux *packetMux, txCtx *srtp.Context, ssrc uint32, ts *uint32, seq *uint16, dur time.Duration) streamStats {
+	stats := streamStats{}
+	t0 := time.Now()
+	deadline := t0.Add(dur)
+
+	state := speechActive
+	stateUntil := t0.Add(randomDuration(1*time.Second, 4*time.Second))
+	nextRTCP := t0.Add(5 * time.Second)
+	totalSleep := time.Duration(0)
+	var pktNTP, pktRTP uint32
+	pktNTP = uint32(time.Now().Unix())
+	pktRTP = *ts
+
+	for time.Now().Before(deadline) {
+		// State transition?
+		if time.Now().After(stateUntil) {
+			// 70/30 weighting — flip to the OTHER state biased
+			// toward active-being-more-common.
+			r := int(randUint32()) % 100
+			if state == speechActive {
+				// 30% chance flip to DTX, 70% stay active (extend)
+				if r < 30 {
+					state = speechDTX
+				}
+			} else {
+				// 70% chance flip to active, 30% stay DTX
+				if r < 70 {
+					state = speechActive
+				}
+			}
+			stateUntil = time.Now().Add(randomDuration(1*time.Second, 4*time.Second))
+			stats.stateChanges++
+		}
+
+		// Build payload according to state.
+		var baseIPI time.Duration
+		var payloadLen int
+		switch state {
+		case speechActive:
+			baseIPI = time.Duration(opusFrameMs) * time.Millisecond // 20ms / 50pps
+			payloadLen = 110 + (int(randUint32()) % 60)             // 110-170B (Opus 64-96kbps)
+		case speechDTX:
+			baseIPI = time.Second // ~1pps comfort noise
+			payloadLen = 5 + (int(randUint32()) % 8)                // 5-12B (Opus DTX frame)
+		}
+
+		// Build + send SRTP packet.
+		payload := make([]byte, payloadLen)
+		rand.Read(payload)
+		pkt := &rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    opusPayloadType,
+				SequenceNumber: *seq,
+				Timestamp:      *ts,
+				SSRC:           ssrc,
+				Marker:         state == speechActive && stats.srtpSent > 0 && (*seq)%50 == 0,
+			},
+			Payload: payload,
+		}
+		raw, _ := pkt.Marshal()
+		encrypted, err := txCtx.EncryptRTP(nil, raw, nil)
+		if err != nil {
+			break
+		}
+		if _, err := mux.WriteSRTP(encrypted); err != nil {
+			break
+		}
+		stats.srtpSent++
+		stats.bytesSent += uint64(len(encrypted))
+		*seq++
+		*ts += uint32(opusFrameSamples)
+
+		// RTCP SR every ~5s.
+		if time.Now().After(nextRTCP) {
+			sr := &rtcp.SenderReport{
+				SSRC:        ssrc,
+				NTPTime:     ntpFromUnix(time.Now()),
+				RTPTime:     pktRTP,
+				PacketCount: uint32(stats.srtpSent),
+				OctetCount:  uint32(stats.bytesSent),
+			}
+			rawRTCP, err := sr.Marshal()
+			if err == nil {
+				encryptedRTCP, err := txCtx.EncryptRTCP(nil, rawRTCP, nil)
+				if err == nil {
+					if _, werr := mux.WriteSRTP(encryptedRTCP); werr == nil {
+						stats.srtcpSent++
+					}
+				}
+			}
+			nextRTCP = time.Now().Add(5 * time.Second)
+		}
+
+		// Pacing with jitter envelope.
+		jitter := time.Duration(int64(randUint32())%3001-1500) * time.Microsecond // ±1.5ms
+		sleep := baseIPI + jitter
+		if sleep < 0 {
+			sleep = 0
+		}
+		totalSleep += sleep
+		time.Sleep(sleep)
+		_ = pktNTP
+	}
+
+	stats.wallTime = time.Since(t0)
+	if stats.srtpSent > 0 {
+		stats.avgIPI = totalSleep / time.Duration(stats.srtpSent)
+	}
+	// Best-effort active-fraction calc: count how many packets were sent
+	// at active rate vs DTX rate. Not exact (state changes mid-budget)
+	// but informative.
+	if stats.wallTime > 0 {
+		// expected pps in pure-active = 50; pure-DTX = 1
+		actualPPS := float64(stats.srtpSent) / stats.wallTime.Seconds()
+		// solve for fraction: 50f + 1(1-f) = actualPPS => f = (actualPPS - 1) / 49
+		f := (actualPPS - 1) / 49
+		if f < 0 {
+			f = 0
+		}
+		if f > 1 {
+			f = 1
+		}
+		stats.activeFrac = f
+	}
+	return stats
+}
+
+// ntpFromUnix produces a 64-bit NTP timestamp (RFC 3550 §4) from a
+// Go time.Time. Returns the upper 32 bits + lower 32 bits packed into
+// a single uint64. Used in RTCP SenderReport.
+func ntpFromUnix(t time.Time) uint64 {
+	const ntpEpochOffset = 2208988800 // seconds between 1900 and 1970 UTC
+	secs := uint64(t.Unix() + ntpEpochOffset)
+	frac := uint64(float64(t.Nanosecond()) / 1e9 * (1 << 32))
+	return secs<<32 | frac
 }
 
 // ----------------------------------------------------------------------------
