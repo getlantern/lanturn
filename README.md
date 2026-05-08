@@ -3,7 +3,7 @@
 A Lantern circumvention transport that mimics WebRTC TURN-relayed media flow on
 plain UDP/3478 with self-hosted coturn on Lantern's international VPS fleet.
 
-**Status: Phase 0 (validation spike)**. See
+**Status: Phase 1 (DTLS-through-relay + SRTP shaping)**. See
 [design draft v0.2](https://github.com/getlantern/circumvention-corpus-private/blob/main/text/2026-05-lanturn-design.md)
 in `circumvention-corpus-private` for the full design (private repo).
 
@@ -93,34 +93,99 @@ attributes will all be parsed and labeled.
 - No TURNS-on-5349 fallback. **Phase 4**.
 - Not wired into lantern-box. **Phase 5**.
 
+## Phase 1 — DTLS-through-relay + SRTP shaping
+
+`cmd/lanturn-phase1/` adds the inner-layer dance:
+
+- Self-signed-cert DTLS handshake between client and egress, **with the
+  bytes traversing inside ChannelData payloads** (coturn forwards them
+  opaquely).
+- SRTP key extraction via RFC 5705 `EXTRACTOR-dtls_srtp` (RFC 5764 §4.2),
+  60 bytes of keying material split into per-direction key+salt pairs.
+- Steady-state SRTP-shaped packets: PT=111 (Opus), v=2 (leading byte
+  `0x80`), incrementing sequence + timestamp at Opus frame cadence
+  (960 samples per 20ms, 50pps).
+- Demux layer (`packetMux`) routes packets between DTLS records (leading
+  bytes 20-25) and SRTP/SRTCP (leading bytes 128-191) — the layer real
+  WebRTC stacks have baked in (pion/transport/v3/mux); minimal hand-rolled
+  version for the spike.
+
+Quick start:
+
+```sh
+go build -o /tmp/lanturn-phase1 ./cmd/lanturn-phase1
+
+# Terminal 1: TURN server (same as Phase 0)
+/tmp/lanturn-phase1 server -listen 127.0.0.1:3478 -secret p1secret
+
+# Terminal 2: egress (raw UDP listener → DTLS server → SRTP receiver)
+/tmp/lanturn-phase1 egress -listen 127.0.0.1:9999
+
+# Terminal 3: client (TURN allocate → DTLS handshake through relay → send N SRTP)
+/tmp/lanturn-phase1 client -server 127.0.0.1:3478 -secret p1secret -peer 127.0.0.1:9999
+```
+
+Expected output (excerpts, abridged):
+
+Client side:
+```
+client: TURN allocate + ChannelBind OK (channel=0x4001 peer=127.0.0.1:9999)
+client: starting DTLS handshake through TURN relay...
+client: DTLS handshake OK in 2.27ms
+client: negotiated SRTP profile: 0x1 (AES-128-CM-HMAC-SHA1-80)
+client: extracted 60 bytes of SRTP keying material
+client: SRTP[0] >>> seq=34922 ts=3521794419 ssrc=0x932573e3 129B (encrypted=151B) leading=0x80
+client: SRTP[1] >>> seq=34923 ts=3521795379 ssrc=0x932573e3 101B (encrypted=123B) leading=0x80
+... 10 packets total ...
+```
+
+Egress side:
+```
+egress: first packet from 127.0.0.1:58303 (135B, leading=0x16)
+egress: DTLS handshake OK in 1.01ms
+egress: extracted 60 bytes of SRTP keying material
+egress: SRTP[0] <<< seq=34922 ts=3521794419 ssrc=0x932573e3 PT=111 payload=129B (encrypted=151B)
+... 10 packets received ...
+```
+
+Wire-level byte-budget check: encrypted = 12 (RTP header) + payload + 10
+(SHA1-80 auth tag). Holds for every packet.
+
 ## Layout
 
 ```
-cmd/lanturn-phase0/main.go    Hand-rolled STUN/TURN encoder/decoder + client + server
-go.mod                         Module spec
-README.md                      This file
+cmd/lanturn-phase0/main.go    Phase 0 — hand-rolled STUN/TURN dance
+cmd/lanturn-phase1/main.go    Phase 1 — DTLS handshake through relay + SRTP
+internal/stun/                Hand-rolled STUN message encode/decode
+internal/turn/                TURN allocate flow + RelayConn (net.Conn wrapper)
+testdata/validate.sh          tshark-based wire-format validation
+go.mod / go.sum / README.md / .gitignore
 ```
-
-Phase 1 will add:
-- `internal/dtls/` — covert-dtls integration for the inner handshake
-- `internal/srtp/` — SRTP-shaped framing for the steady state
-- `cmd/lanturn-phase1/` — the next spike
 
 ## Phases (from the design doc)
 
-- **Phase 0**: validate ✅ (this spike)
-- **Phase 1**: SRTP shaping with covert-dtls
-- **Phase 2**: behavioral mimicry + coturn-fleet rotation + Lantern config integration
+- **Phase 0**: validate ✅
+- **Phase 1**: SRTP shaping ✅ (this spike — but **without** covert-dtls
+  fingerprint randomization; see Hard rules below)
+- **Phase 2**: behavioral mimicry + coturn-fleet rotation + Lantern
+  config integration + **covert-dtls fingerprint hook** (required for
+  Russia/China rollout)
 - **Phase 3**: video-shape profiles
 - **Phase 4**: TURNS-on-5349 fallback
 - **Phase 5**: lantern-box integration + field test
 
 ## Hard rules
 
-- Do **NOT** use stock pion/dtls for the client-side DTLS handshake in any
-  phase. Use covert-dtls from Lantern Unbounded
-  (`common/covertdtls/`) — the post-March-2026 TSPU pion-fingerprint matcher
-  blocks the default. See the design doc §4.4 and the `cover-dtls` catalog
-  entry §Censor Practice.
-- pion/turn for the **server-side** TURN protocol is fine in any phase — the
-  TSPU matcher is on DTLS ClientHello, not on TURN bytes.
+- **Phase 1 uses stock pion/dtls without fingerprint randomization** —
+  fine for validation spike, **NOT** acceptable for Russia / China
+  deployment. The pion-default DTLS ClientHello fingerprint is matched
+  by TSPU since March 2026 (net4people/bbs#603). Phase 2 will integrate
+  `common/covertdtls/` from Lantern Unbounded (which wraps pion/dtls
+  with the upstream `theodorsm/covert-dtls` randomize / mimic hooks)
+  and the design doc §4.4 forbids deployment without it. See cover-dtls
+  catalog §Censor Practice for the attack details.
+- pion/turn for the **server-side** TURN protocol is fine in any phase
+  — the TSPU matcher is on DTLS ClientHello, not on TURN bytes.
+- pion/dtls for the **server-side** of the inner DTLS (the egress) is
+  fine in any phase — the same reasoning. DTLS-server-fingerprinting in
+  deployed censors is less mature than client-fingerprinting.
