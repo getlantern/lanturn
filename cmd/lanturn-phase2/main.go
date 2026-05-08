@@ -96,7 +96,8 @@ func main() {
 		}
 	case "client":
 		fs := flag.NewFlagSet("client", flag.ExitOnError)
-		server := fs.String("server", "127.0.0.1:3478", "TURN server")
+		server := fs.String("server", "127.0.0.1:3478", "TURN server (single endpoint; for fleet rotation use -servers)")
+		servers := fs.String("servers", "", "comma-separated TURN server endpoints; overrides -server when set")
 		secret := fs.String("secret", "lanturn-phase2-shared-secret", "static-auth-secret")
 		peer := fs.String("peer", "127.0.0.1:9999", "egress address")
 		fpMode := fs.String("fingerprint", "mimic", "DTLS ClientHello fingerprint mode: mimic | randomize | none")
@@ -106,7 +107,18 @@ func main() {
 		idleGapMax := fs.Duration("idle-gap-max", 1*time.Second, "max idle gap between sessions (production target: 5min)")
 		retries := fs.Int("retries", 3, "DTLS handshake retries per session")
 		fs.Parse(os.Args[2:])
-		if err := runClient(*server, *secret, *peer, *fpMode, *sessionCount, *sessionDur, *idleGapMin, *idleGapMax, *retries); err != nil {
+		var endpoints []string
+		if *servers != "" {
+			for _, s := range strings.Split(*servers, ",") {
+				s = strings.TrimSpace(s)
+				if s != "" {
+					endpoints = append(endpoints, s)
+				}
+			}
+		} else {
+			endpoints = []string{*server}
+		}
+		if err := runClient(endpoints, *secret, *peer, *fpMode, *sessionCount, *sessionDur, *idleGapMin, *idleGapMax, *retries); err != nil {
 			log.Fatal(err)
 		}
 	default:
@@ -182,23 +194,31 @@ func useAuthSecretHandler(secret string) pionturn.AuthHandler {
 // the spike, default duration is short so smoke tests run quickly.
 // ----------------------------------------------------------------------------
 
-func runClient(server, secret, peerStr, fpMode string, sessionCount int, sessionDur, idleMin, idleMax time.Duration, retries int) error {
+func runClient(endpoints []string, secret, peerStr, fpMode string, sessionCount int, sessionDur, idleMin, idleMax time.Duration, retries int) error {
 	peerIP, peerPort, err := parseHostPort(peerStr)
 	if err != nil {
 		return err
 	}
+	fleet := newFleetSelector(endpoints)
+	log.Printf("client: coturn fleet of %d endpoints: %v", len(endpoints), endpoints)
 
 	for sessionNum := 1; sessionNum <= sessionCount; sessionNum++ {
-		log.Printf("=== session %d/%d starting (target duration %s) ===", sessionNum, sessionCount, sessionDur)
+		server, ok := fleet.pick()
+		if !ok {
+			return fmt.Errorf("session %d: no healthy coturn endpoints in fleet", sessionNum)
+		}
+		log.Printf("=== session %d/%d starting (target duration %s, server=%s) ===", sessionNum, sessionCount, sessionDur, server)
 		var lastErr error
 		for attempt := 1; attempt <= retries; attempt++ {
 			err := runClientSession(server, secret, peerIP, peerPort, fpMode, sessionDur)
 			if err == nil {
+				fleet.recordSuccess(server)
 				lastErr = nil
 				break
 			}
 			lastErr = err
 			log.Printf("session %d attempt %d failed: %v", sessionNum, attempt, err)
+			fleet.recordFailure(server)
 			if attempt < retries {
 				time.Sleep(200 * time.Millisecond)
 			}
@@ -214,6 +234,7 @@ func runClient(server, secret, peerStr, fpMode string, sessionCount int, session
 			time.Sleep(gap)
 		}
 	}
+	log.Printf("fleet stats: %s", fleet.statsString())
 	return nil
 }
 
@@ -459,6 +480,132 @@ func runEgressSession(pc net.PacketConn, demux *egressDemuxer, ev *sessionEvent)
 	}
 	log.Printf("egress: session received srtp=%d srtcp=%d decrypt-errs=%d", srtpCount, srtcpCount, decryptErrs)
 	return nil
+}
+
+// ----------------------------------------------------------------------------
+// fleetSelector — Phase 2d coturn-fleet rotation.
+//
+// Each session picks an endpoint via:
+//   1. Filter to healthy endpoints (consecutive-failure count below
+//      threshold; failed endpoints heal after a cool-off window).
+//   2. Among healthy, pick uniformly at random — but if the previous
+//      session's endpoint is still healthy AND there are >=2 healthy
+//      endpoints, prefer NOT picking it (recency penalty). This avoids
+//      back-to-back use of one endpoint, matching the behavioral
+//      expectation that a real WebRTC user touches multiple TURN
+//      relays over a day.
+//
+// Production fleet management would also do periodic health probing,
+// background refresh from Lantern config, and metrics export. Spike
+// scope is just selection + per-session success/failure tracking.
+// ----------------------------------------------------------------------------
+
+const (
+	fleetUnhealthyAfter   = 3              // consecutive failures
+	fleetHealCooldown     = 5 * time.Minute
+)
+
+type fleetEndpoint struct {
+	addr            string
+	consecFails     int
+	totalSuccess    int
+	totalFail       int
+	unhealthySince  time.Time
+}
+
+type fleetSelector struct {
+	mu       sync.Mutex
+	endpoints []*fleetEndpoint
+	lastUsed string
+}
+
+func newFleetSelector(addrs []string) *fleetSelector {
+	f := &fleetSelector{}
+	for _, a := range addrs {
+		f.endpoints = append(f.endpoints, &fleetEndpoint{addr: a})
+	}
+	return f
+}
+
+func (f *fleetSelector) pick() (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	now := time.Now()
+	var healthy []*fleetEndpoint
+	for _, e := range f.endpoints {
+		if e.consecFails >= fleetUnhealthyAfter {
+			if now.Sub(e.unhealthySince) < fleetHealCooldown {
+				continue
+			}
+			// Heal after cool-off.
+			e.consecFails = 0
+		}
+		healthy = append(healthy, e)
+	}
+	if len(healthy) == 0 {
+		return "", false
+	}
+
+	// Recency-weighted pick: if >=2 healthy and lastUsed is in healthy,
+	// pick from healthy minus lastUsed.
+	candidates := healthy
+	if len(healthy) >= 2 && f.lastUsed != "" {
+		filtered := candidates[:0:0]
+		for _, e := range healthy {
+			if e.addr != f.lastUsed {
+				filtered = append(filtered, e)
+			}
+		}
+		if len(filtered) > 0 {
+			candidates = filtered
+		}
+	}
+
+	pick := candidates[int(randUint32())%len(candidates)]
+	f.lastUsed = pick.addr
+	return pick.addr, true
+}
+
+func (f *fleetSelector) recordSuccess(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range f.endpoints {
+		if e.addr == addr {
+			e.consecFails = 0
+			e.totalSuccess++
+			return
+		}
+	}
+}
+
+func (f *fleetSelector) recordFailure(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range f.endpoints {
+		if e.addr == addr {
+			e.consecFails++
+			e.totalFail++
+			if e.consecFails >= fleetUnhealthyAfter {
+				e.unhealthySince = time.Now()
+			}
+			return
+		}
+	}
+}
+
+func (f *fleetSelector) statsString() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var parts []string
+	for _, e := range f.endpoints {
+		health := "healthy"
+		if e.consecFails >= fleetUnhealthyAfter {
+			health = "unhealthy"
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s(s=%d,f=%d)", e.addr, health, e.totalSuccess, e.totalFail))
+	}
+	return strings.Join(parts, " ")
 }
 
 // ----------------------------------------------------------------------------
