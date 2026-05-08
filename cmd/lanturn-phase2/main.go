@@ -1,0 +1,684 @@
+// lanturn-phase2 — Phase 2 spike: behavioral mimicry on top of the
+// Phase 1 DTLS-through-relay + SRTP foundation.
+//
+// Phase 2 deliverables (per design doc §9):
+//
+//   - covert-dtls fingerprint randomization on the inner DTLS handshake
+//     (the design's hard requirement for Russia / China rollout — see
+//     `cover-dtls` catalog §Censor Practice for the TSPU March 2026
+//     attack against the pion-default fingerprint).
+//   - Session rotation: ~30-min "calls" with brief idle gaps. Each
+//     session is a fresh allocation, fresh OAUTH creds, fresh DTLS
+//     handshake, fresh SRTP keys, fresh SSRC + sequence + timestamps.
+//   - Pacing fidelity: jitter envelope on inter-packet timing,
+//     RTCP SR/RR interleaving, DTX during quiet periods.
+//   - coturn-fleet rotation: client picks endpoint per session from a
+//     list, with recency weighting.
+//
+// This file lands those incrementally — Phase 2a covers the
+// covert-dtls + pion/dtls/v3 migration; subsequent commits layer on
+// session rotation, pacing fidelity, and fleet rotation.
+//
+// Architecture is the same as Phase 1; see design doc §4 and the
+// Phase 1 main.go for the diagram.
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha1"
+	"crypto/tls"
+	"encoding/base64"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/getlantern/lanturn/internal/stun"
+	"github.com/getlantern/lanturn/internal/turn"
+
+	"github.com/pion/dtls/v3"
+	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
+	"github.com/pion/logging"
+	"github.com/pion/rtp"
+	"github.com/pion/srtp/v3"
+	pionturn "github.com/pion/turn/v3"
+	"github.com/theodorsm/covert-dtls/pkg/mimicry"
+	"github.com/theodorsm/covert-dtls/pkg/randomize"
+)
+
+const (
+	dtlsSRTPProfile = dtls.SRTP_AES128_CM_HMAC_SHA1_80
+	srtpProfile     = srtp.ProtectionProfileAes128CmHmacSha1_80
+
+	srtpKeyMaterialLen = 60
+	srtpKeyLen         = 16
+	srtpSaltLen        = 14
+)
+
+const (
+	channelNum       uint16 = 0x4001
+	opusPayloadType  uint8  = 111
+	opusSampleRate          = 48000
+	opusFrameMs             = 20
+	opusFrameSamples        = opusSampleRate * opusFrameMs / 1000
+	packetsPerFlow          = 10
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "server":
+		fs := flag.NewFlagSet("server", flag.ExitOnError)
+		listen := fs.String("listen", "0.0.0.0:3478", "TURN server udp listen addr")
+		realm := fs.String("realm", "lanturn.example", "TURN realm")
+		secret := fs.String("secret", "lanturn-phase2-shared-secret", "static-auth-secret")
+		fs.Parse(os.Args[2:])
+		if err := runServer(*listen, *realm, *secret); err != nil {
+			log.Fatal(err)
+		}
+	case "egress":
+		fs := flag.NewFlagSet("egress", flag.ExitOnError)
+		listen := fs.String("listen", "127.0.0.1:9999", "egress udp listen addr")
+		fs.Parse(os.Args[2:])
+		if err := runEgress(*listen); err != nil {
+			log.Fatal(err)
+		}
+	case "client":
+		fs := flag.NewFlagSet("client", flag.ExitOnError)
+		server := fs.String("server", "127.0.0.1:3478", "TURN server")
+		secret := fs.String("secret", "lanturn-phase2-shared-secret", "static-auth-secret")
+		peer := fs.String("peer", "127.0.0.1:9999", "egress address")
+		fpMode := fs.String("fingerprint", "mimic", "DTLS ClientHello fingerprint mode: mimic | randomize | none")
+		fs.Parse(os.Args[2:])
+		if err := runClient(*server, *secret, *peer, *fpMode); err != nil {
+			log.Fatal(err)
+		}
+	default:
+		usage()
+		os.Exit(2)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Server subcommand: same as Phase 0/1.
+// ----------------------------------------------------------------------------
+
+func runServer(listen, realm, secret string) error {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return err
+	}
+	if host == "" {
+		host = "0.0.0.0"
+	}
+	udpListener, err := net.ListenPacket("udp4", listen)
+	if err != nil {
+		return fmt.Errorf("listen UDP %s: %w", listen, err)
+	}
+	pubIP := net.ParseIP("127.0.0.1")
+	if pip := os.Getenv("LANTURN_PUBLIC_IP"); pip != "" {
+		pubIP = net.ParseIP(pip)
+	}
+	server, err := pionturn.NewServer(pionturn.ServerConfig{
+		Realm:         realm,
+		AuthHandler:   useAuthSecretHandler(secret),
+		LoggerFactory: logging.NewDefaultLoggerFactory(),
+		PacketConnConfigs: []pionturn.PacketConnConfig{
+			{
+				PacketConn: udpListener,
+				RelayAddressGenerator: &pionturn.RelayAddressGeneratorStatic{
+					RelayAddress: pubIP,
+					Address:      host,
+				},
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	log.Printf("TURN server listening on %s (realm=%s, public-ip=%s)", listen, realm, pubIP)
+	defer server.Close()
+	select {}
+}
+
+func useAuthSecretHandler(secret string) pionturn.AuthHandler {
+	return func(username, realm string, srcAddr net.Addr) ([]byte, bool) {
+		parts := strings.SplitN(username, ":", 2)
+		if len(parts) != 2 {
+			return nil, false
+		}
+		exp, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil || time.Now().Unix() > exp {
+			return nil, false
+		}
+		mac := hmac.New(sha1.New, []byte(secret))
+		mac.Write([]byte(username))
+		password := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+		log.Printf("server auth: %s OK", username)
+		return stun.LongTermKey(username, realm, password), true
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Client subcommand: TURN allocate → DTLS handshake (with covert-dtls
+// fingerprint randomization) → SRTP send.
+// ----------------------------------------------------------------------------
+
+func runClient(server, secret, peerStr, fpMode string) error {
+	peerIP, peerPort, err := parseHostPort(peerStr)
+	if err != nil {
+		return err
+	}
+
+	alloc, err := turn.Allocate(turn.AllocateConfig{
+		Server:  server,
+		Secret:  secret,
+		CredID:  "lanturn-phase2",
+		CredTTL: 5 * time.Minute,
+		Logf:    log.Printf,
+	})
+	if err != nil {
+		return err
+	}
+	defer alloc.UDP.Close()
+
+	if err := alloc.CreatePermission(peerIP, peerPort); err != nil {
+		return err
+	}
+	if err := alloc.ChannelBind(channelNum, peerIP, peerPort); err != nil {
+		return err
+	}
+	log.Printf("client: TURN allocate + ChannelBind OK (channel=%#04x peer=%s:%d)", channelNum, peerIP, peerPort)
+
+	// Inner-layer transport: ChannelData payloads in/out of coturn.
+	relay := alloc.NewRelayConn(channelNum)
+	mux := newPacketMux(relay, "client")
+	defer mux.Close()
+
+	cert, err := selfsign.GenerateSelfSigned()
+	if err != nil {
+		return fmt.Errorf("self-signed cert: %w", err)
+	}
+
+	dtlsCfg := &dtls.Config{
+		Certificates:           []tls.Certificate{cert},
+		InsecureSkipVerify:     true,
+		ExtendedMasterSecret:   dtls.RequireExtendedMasterSecret,
+		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{dtlsSRTPProfile},
+	}
+
+	// Covert-DTLS fingerprint randomization. The pion-default DTLS
+	// ClientHello has been TSPU-fingerprint-blocked since March 2026
+	// (cover-dtls catalog §Censor Practice). Three modes:
+	//
+	//   - mimic: replay a real (recent Chrome) DTLS ClientHello,
+	//     selected at random from covert-dtls's hardcoded fingerprint
+	//     database. ~100% handshake success rate. Default.
+	//   - randomize: shuffle + subset the cipher-suite list, randomize
+	//     extensions. ~85% handshake success rate (random cipher
+	//     subset occasionally lacks any cert-compatible cipher) —
+	//     production usage MUST handle retry on InsufficientSecurity.
+	//   - none: pion-default fingerprint. TSPU-blocked since March
+	//     2026; do NOT deploy.
+	switch strings.ToLower(fpMode) {
+	case "mimic":
+		hooker := &mimicry.MimickedClientHello{}
+		if err := hooker.LoadRandomFingerprint(); err != nil {
+			return fmt.Errorf("load random Chrome fingerprint: %w", err)
+		}
+		dtlsCfg.ClientHelloMessageHook = hooker.Hook
+		log.Printf("client: covert-dtls mimic mode enabled (random Chrome fingerprint)")
+	case "randomize":
+		hooker := &randomize.RandomizedMessageClientHello{RandomALPN: true}
+		dtlsCfg.ClientHelloMessageHook = hooker.Hook
+		log.Printf("client: covert-dtls randomize mode enabled (RandomALPN=true)")
+	case "none":
+		log.Printf("client: covert-dtls DISABLED — using pion-default fingerprint (TSPU-blocked!)")
+	default:
+		return fmt.Errorf("unknown -fingerprint mode %q (want: mimic | randomize | none)", fpMode)
+	}
+
+	peerUDPAddr := &net.UDPAddr{IP: peerIP, Port: peerPort}
+
+	log.Printf("client: starting DTLS handshake through TURN relay...")
+	t0 := time.Now()
+	dtlsConn, err := dtls.Client(mux.DTLSPacketConn(peerUDPAddr), peerUDPAddr, dtlsCfg)
+	if err != nil {
+		return fmt.Errorf("DTLS Client setup: %w", err)
+	}
+	defer dtlsConn.Close()
+	if err := dtlsConn.Handshake(); err != nil {
+		return fmt.Errorf("DTLS handshake: %w", err)
+	}
+	log.Printf("client: DTLS handshake OK in %s", time.Since(t0))
+
+	profile, ok := dtlsConn.SelectedSRTPProtectionProfile()
+	if !ok || profile != dtlsSRTPProfile {
+		return fmt.Errorf("expected SRTP profile %d, got %d ok=%v", dtlsSRTPProfile, profile, ok)
+	}
+	log.Printf("client: negotiated SRTP profile: %#x (AES-128-CM-HMAC-SHA1-80)", uint16(profile))
+
+	state, ok2 := dtlsConn.ConnectionState()
+	if !ok2 {
+		return fmt.Errorf("connection state not available")
+	}
+	keyMat, err := state.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, srtpKeyMaterialLen)
+	if err != nil {
+		return fmt.Errorf("export keying material: %w", err)
+	}
+	log.Printf("client: extracted %d bytes of SRTP keying material", len(keyMat))
+
+	clientWriteKey, clientWriteSalt, _, _ := splitSRTPKeys(keyMat)
+	txCtx, err := srtp.CreateContext(clientWriteKey, clientWriteSalt, srtpProfile)
+	if err != nil {
+		return fmt.Errorf("create SRTP TX context: %w", err)
+	}
+	log.Printf("client: SRTP TX context ready, sending %d Opus-shaped packets...", packetsPerFlow)
+
+	ssrc := randUint32()
+	startTS := randUint32()
+	startSeq := uint16(randUint32() & 0xFFFF)
+
+	for i := 0; i < packetsPerFlow; i++ {
+		payloadLen := 100 + (int(randUint32()) % 80)
+		payload := make([]byte, payloadLen)
+		rand.Read(payload)
+		pkt := &rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    opusPayloadType,
+				SequenceNumber: startSeq + uint16(i),
+				Timestamp:      startTS + uint32(i*opusFrameSamples),
+				SSRC:           ssrc,
+			},
+			Payload: payload,
+		}
+		raw, err := pkt.Marshal()
+		if err != nil {
+			return err
+		}
+		encrypted, err := txCtx.EncryptRTP(nil, raw, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := mux.WriteSRTP(encrypted); err != nil {
+			return err
+		}
+		log.Printf("client: SRTP[%d] >>> seq=%d ts=%d ssrc=%#x %dB (encrypted=%dB)",
+			i, pkt.SequenceNumber, pkt.Timestamp, pkt.SSRC, len(payload), len(encrypted))
+		time.Sleep(time.Duration(opusFrameMs) * time.Millisecond)
+	}
+	log.Printf("client: all %d SRTP packets sent.", packetsPerFlow)
+
+	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+
+// ----------------------------------------------------------------------------
+// Egress subcommand: raw UDP listener → DTLS server → SRTP receiver.
+// ----------------------------------------------------------------------------
+
+func runEgress(listen string) error {
+	pc, err := net.ListenPacket("udp", listen)
+	if err != nil {
+		return fmt.Errorf("listen UDP %s: %w", listen, err)
+	}
+	log.Printf("egress: listening on %s, waiting for first packet...", listen)
+
+	buf := make([]byte, 4096)
+	pc.SetReadDeadline(time.Time{})
+	n, srcAddr, err := pc.ReadFrom(buf)
+	if err != nil {
+		return fmt.Errorf("read first packet: %w", err)
+	}
+	log.Printf("egress: first packet from %s (%dB, leading=%#02x)", srcAddr, n, buf[0])
+
+	ssconn := &singleSourceConn{
+		pc:         pc,
+		remoteAddr: srcAddr,
+		firstPkt:   append([]byte{}, buf[:n]...),
+	}
+	mux := newPacketMux(ssconn, "egress")
+	defer mux.Close()
+
+	cert, err := selfsign.GenerateSelfSigned()
+	if err != nil {
+		return err
+	}
+	dtlsCfg := &dtls.Config{
+		Certificates:           []tls.Certificate{cert},
+		InsecureSkipVerify:     true,
+		ExtendedMasterSecret:   dtls.RequireExtendedMasterSecret,
+		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{dtlsSRTPProfile},
+	}
+	log.Printf("egress: starting DTLS server handshake...")
+	t0 := time.Now()
+	dtlsConn, err := dtls.Server(mux.DTLSPacketConn(srcAddr), srcAddr, dtlsCfg)
+	if err != nil {
+		return fmt.Errorf("DTLS Server setup: %w", err)
+	}
+	defer dtlsConn.Close()
+	if err := dtlsConn.Handshake(); err != nil {
+		return fmt.Errorf("DTLS handshake: %w", err)
+	}
+	log.Printf("egress: DTLS handshake OK in %s", time.Since(t0))
+
+	profile, ok := dtlsConn.SelectedSRTPProtectionProfile()
+	if !ok {
+		return fmt.Errorf("no SRTP profile negotiated")
+	}
+	log.Printf("egress: negotiated SRTP profile: %#x", uint16(profile))
+
+	state, ok2 := dtlsConn.ConnectionState()
+	if !ok2 {
+		return fmt.Errorf("connection state not available")
+	}
+	keyMat, err := state.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, srtpKeyMaterialLen)
+	if err != nil {
+		return err
+	}
+	log.Printf("egress: extracted %d bytes of SRTP keying material", len(keyMat))
+
+	clientWriteKey, clientWriteSalt, _, _ := splitSRTPKeys(keyMat)
+	rxCtx, err := srtp.CreateContext(clientWriteKey, clientWriteSalt, srtpProfile)
+	if err != nil {
+		return err
+	}
+	log.Printf("egress: SRTP RX context ready, listening for packets...")
+
+	rxBuf := make([]byte, 4096)
+	for i := 0; i < packetsPerFlow; i++ {
+		mux.srtpReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := mux.ReadSRTP(rxBuf)
+		if err != nil {
+			return err
+		}
+		decrypted, err := rxCtx.DecryptRTP(nil, rxBuf[:n], nil)
+		if err != nil {
+			return err
+		}
+		pkt := &rtp.Packet{}
+		if err := pkt.Unmarshal(decrypted); err != nil {
+			return err
+		}
+		log.Printf("egress: SRTP[%d] <<< seq=%d ts=%d ssrc=%#x PT=%d %dB (encrypted=%dB)",
+			i, pkt.SequenceNumber, pkt.Timestamp, pkt.SSRC, pkt.PayloadType, len(pkt.Payload), n)
+	}
+	log.Printf("egress: received all %d SRTP packets.", packetsPerFlow)
+	return nil
+}
+
+// ----------------------------------------------------------------------------
+// packetMux — refactored from Phase 1 to provide net.PacketConn for
+// pion/dtls/v3 (which switched from net.Conn to net.PacketConn-based
+// constructors).
+//
+// Demux rules from RFC 5764 §5:
+//   - 0x00-0x13 (decimal 0-19) = STUN (unused post-handshake here)
+//   - 0x14-0x19 (decimal 20-25) = DTLS records
+//   - 0x80-0xBF (decimal 128-191) = RTP/RTCP (RTP version 2)
+// ----------------------------------------------------------------------------
+
+type packetMux struct {
+	underlying io.ReadWriteCloser
+	label      string
+
+	dtlsCh chan []byte
+	srtpCh chan []byte
+
+	srtpDeadlineMu sync.Mutex
+	srtpDeadline   time.Time
+
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newPacketMux(underlying io.ReadWriteCloser, label string) *packetMux {
+	m := &packetMux{
+		underlying: underlying,
+		label:      label,
+		dtlsCh:     make(chan []byte, 64),
+		srtpCh:     make(chan []byte, 64),
+		closed:     make(chan struct{}),
+	}
+	go m.readLoop()
+	return m
+}
+
+func (m *packetMux) readLoop() {
+	buf := make([]byte, 4096)
+	for {
+		n, err := m.underlying.Read(buf)
+		if err != nil {
+			m.Close()
+			return
+		}
+		if n == 0 {
+			continue
+		}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		first := pkt[0]
+		switch {
+		case first >= 20 && first <= 25:
+			select {
+			case m.dtlsCh <- pkt:
+			case <-m.closed:
+				return
+			}
+		case first >= 128 && first <= 191:
+			select {
+			case m.srtpCh <- pkt:
+			case <-m.closed:
+				return
+			}
+		default:
+			log.Printf("[%s mux] dropping packet with leading byte %#02x (%dB)", m.label, first, n)
+		}
+	}
+}
+
+func (m *packetMux) Close() error {
+	m.closeOnce.Do(func() {
+		close(m.closed)
+		m.underlying.Close()
+	})
+	return nil
+}
+
+// DTLSPacketConn returns a net.PacketConn over the dtls-classified
+// channel. peerAddr is reported as the remote on every ReadFrom.
+func (m *packetMux) DTLSPacketConn(peerAddr net.Addr) net.PacketConn {
+	return &muxPacketConn{mux: m, ch: m.dtlsCh, peerAddr: peerAddr, localAddr: dummyAddr{}}
+}
+
+func (m *packetMux) WriteSRTP(p []byte) (int, error) { return m.underlying.Write(p) }
+
+func (m *packetMux) ReadSRTP(p []byte) (int, error) {
+	m.srtpDeadlineMu.Lock()
+	dl := m.srtpDeadline
+	m.srtpDeadlineMu.Unlock()
+	var deadline <-chan time.Time
+	if !dl.IsZero() {
+		t := time.NewTimer(time.Until(dl))
+		defer t.Stop()
+		deadline = t.C
+	}
+	select {
+	case pkt := <-m.srtpCh:
+		return copy(p, pkt), nil
+	case <-deadline:
+		return 0, fmt.Errorf("read SRTP timeout")
+	case <-m.closed:
+		return 0, io.EOF
+	}
+}
+
+func (m *packetMux) srtpReadDeadline(t time.Time) {
+	m.srtpDeadlineMu.Lock()
+	defer m.srtpDeadlineMu.Unlock()
+	m.srtpDeadline = t
+}
+
+type muxPacketConn struct {
+	mux       *packetMux
+	ch        chan []byte
+	peerAddr  net.Addr
+	localAddr net.Addr
+
+	rdDeadlineMu sync.Mutex
+	rdDeadline   time.Time
+}
+
+func (c *muxPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.rdDeadlineMu.Lock()
+	dl := c.rdDeadline
+	c.rdDeadlineMu.Unlock()
+	var deadline <-chan time.Time
+	if !dl.IsZero() {
+		t := time.NewTimer(time.Until(dl))
+		defer t.Stop()
+		deadline = t.C
+	}
+	select {
+	case pkt := <-c.ch:
+		return copy(p, pkt), c.peerAddr, nil
+	case <-deadline:
+		return 0, nil, fmt.Errorf("read deadline exceeded")
+	case <-c.mux.closed:
+		return 0, nil, io.EOF
+	}
+}
+
+func (c *muxPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	return c.mux.underlying.Write(p)
+}
+
+func (c *muxPacketConn) Close() error             { return c.mux.Close() }
+func (c *muxPacketConn) LocalAddr() net.Addr      { return c.localAddr }
+func (c *muxPacketConn) SetDeadline(t time.Time) error {
+	c.SetReadDeadline(t)
+	return nil
+}
+func (c *muxPacketConn) SetReadDeadline(t time.Time) error {
+	c.rdDeadlineMu.Lock()
+	defer c.rdDeadlineMu.Unlock()
+	c.rdDeadline = t
+	return nil
+}
+func (c *muxPacketConn) SetWriteDeadline(t time.Time) error { return nil }
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "muxed" }
+func (dummyAddr) String() string  { return "muxed" }
+
+// ----------------------------------------------------------------------------
+// singleSourceConn — wrap a net.PacketConn as a net.Conn pinned to one peer.
+// The first packet that arrived (passed in) is replayed on the first Read.
+// ----------------------------------------------------------------------------
+
+type singleSourceConn struct {
+	pc         net.PacketConn
+	remoteAddr net.Addr
+
+	mu       sync.Mutex
+	firstPkt []byte
+	consumed bool
+}
+
+func (c *singleSourceConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	if !c.consumed && len(c.firstPkt) > 0 {
+		n := copy(p, c.firstPkt)
+		c.consumed = true
+		c.mu.Unlock()
+		return n, nil
+	}
+	c.mu.Unlock()
+
+	for {
+		buf := make([]byte, 4096)
+		n, addr, err := c.pc.ReadFrom(buf)
+		if err != nil {
+			return 0, err
+		}
+		if addr.String() != c.remoteAddr.String() {
+			continue
+		}
+		return copy(p, buf[:n]), nil
+	}
+}
+
+func (c *singleSourceConn) Write(p []byte) (int, error) {
+	return c.pc.WriteTo(p, c.remoteAddr)
+}
+
+func (c *singleSourceConn) Close() error                       { return c.pc.Close() }
+func (c *singleSourceConn) LocalAddr() net.Addr                { return c.pc.LocalAddr() }
+func (c *singleSourceConn) RemoteAddr() net.Addr               { return c.remoteAddr }
+func (c *singleSourceConn) SetDeadline(t time.Time) error      { return c.pc.SetDeadline(t) }
+func (c *singleSourceConn) SetReadDeadline(t time.Time) error  { return c.pc.SetReadDeadline(t) }
+func (c *singleSourceConn) SetWriteDeadline(t time.Time) error { return c.pc.SetWriteDeadline(t) }
+
+// ----------------------------------------------------------------------------
+// helpers
+// ----------------------------------------------------------------------------
+
+func splitSRTPKeys(keyMat []byte) (clientKey, clientSalt, serverKey, serverSalt []byte) {
+	clientKey = keyMat[0:srtpKeyLen]
+	serverKey = keyMat[srtpKeyLen : 2*srtpKeyLen]
+	clientSalt = keyMat[2*srtpKeyLen : 2*srtpKeyLen+srtpSaltLen]
+	serverSalt = keyMat[2*srtpKeyLen+srtpSaltLen : 2*srtpKeyLen+2*srtpSaltLen]
+	return
+}
+
+func parseHostPort(s string) (net.IP, int, error) {
+	h, p, err := net.SplitHostPort(s)
+	if err != nil {
+		return nil, 0, err
+	}
+	port, _ := strconv.Atoi(p)
+	ip := net.ParseIP(h)
+	if ip == nil {
+		return nil, 0, fmt.Errorf("bad ip %q", h)
+	}
+	return ip, port, nil
+}
+
+func randUint32() uint32 {
+	var b [4]byte
+	rand.Read(b[:])
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `lanturn-phase2 — DTLS-through-relay + SRTP shaping with covert-dtls.
+
+Subcommands (same shape as Phase 1):
+
+  lanturn-phase2 server [-listen 0.0.0.0:3478] [-realm STR] [-secret STR]
+  lanturn-phase2 egress [-listen 127.0.0.1:9999]
+  lanturn-phase2 client [-server HOST:PORT] [-secret STR] [-peer HOST:PORT]
+                        [-fingerprint randomize|none]
+
+Phase 2a (this commit) adds:
+  - pion/dtls/v3 migration (v2 lacks ClientHelloMessageHook)
+  - covert-dtls per-session ClientHello randomization
+  - net.PacketConn-shaped mux (v3 API change)
+
+Phase 2b/c/d will layer on session rotation, jitter envelope, RTCP /
+DTX / NACK-RTX, and coturn-fleet rotation.
+
+`)
+}
