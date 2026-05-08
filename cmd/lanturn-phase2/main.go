@@ -68,7 +68,6 @@ const (
 	opusSampleRate          = 48000
 	opusFrameMs             = 20
 	opusFrameSamples        = opusSampleRate * opusFrameMs / 1000
-	packetsPerFlow          = 10
 )
 
 func main() {
@@ -89,8 +88,9 @@ func main() {
 	case "egress":
 		fs := flag.NewFlagSet("egress", flag.ExitOnError)
 		listen := fs.String("listen", "127.0.0.1:9999", "egress udp listen addr")
+		sessionCount := fs.Int("sessions", 3, "number of back-to-back sessions to accept")
 		fs.Parse(os.Args[2:])
-		if err := runEgress(*listen); err != nil {
+		if err := runEgress(*listen, *sessionCount); err != nil {
 			log.Fatal(err)
 		}
 	case "client":
@@ -99,8 +99,13 @@ func main() {
 		secret := fs.String("secret", "lanturn-phase2-shared-secret", "static-auth-secret")
 		peer := fs.String("peer", "127.0.0.1:9999", "egress address")
 		fpMode := fs.String("fingerprint", "mimic", "DTLS ClientHello fingerprint mode: mimic | randomize | none")
+		sessionCount := fs.Int("sessions", 3, "number of back-to-back sessions to run")
+		sessionDur := fs.Duration("session-duration", 1*time.Second, "duration of each session (production target: 25-35 min)")
+		idleGapMin := fs.Duration("idle-gap-min", 200*time.Millisecond, "min idle gap between sessions (production target: 30s)")
+		idleGapMax := fs.Duration("idle-gap-max", 1*time.Second, "max idle gap between sessions (production target: 5min)")
+		retries := fs.Int("retries", 3, "DTLS handshake retries per session")
 		fs.Parse(os.Args[2:])
-		if err := runClient(*server, *secret, *peer, *fpMode); err != nil {
+		if err := runClient(*server, *secret, *peer, *fpMode, *sessionCount, *sessionDur, *idleGapMin, *idleGapMax, *retries); err != nil {
 			log.Fatal(err)
 		}
 	default:
@@ -170,16 +175,50 @@ func useAuthSecretHandler(secret string) pionturn.AuthHandler {
 }
 
 // ----------------------------------------------------------------------------
-// Client subcommand: TURN allocate → DTLS handshake (with covert-dtls
-// fingerprint randomization) → SRTP send.
+// Client subcommand: orchestrates a series of sessions, each a fresh
+// allocate / DTLS handshake / SRTP flow, with idle gaps in between.
+// Each "session" simulates a single ~30-min "call" in production. For
+// the spike, default duration is short so smoke tests run quickly.
 // ----------------------------------------------------------------------------
 
-func runClient(server, secret, peerStr, fpMode string) error {
+func runClient(server, secret, peerStr, fpMode string, sessionCount int, sessionDur, idleMin, idleMax time.Duration, retries int) error {
 	peerIP, peerPort, err := parseHostPort(peerStr)
 	if err != nil {
 		return err
 	}
 
+	for sessionNum := 1; sessionNum <= sessionCount; sessionNum++ {
+		log.Printf("=== session %d/%d starting (target duration %s) ===", sessionNum, sessionCount, sessionDur)
+		var lastErr error
+		for attempt := 1; attempt <= retries; attempt++ {
+			err := runClientSession(server, secret, peerIP, peerPort, fpMode, sessionDur)
+			if err == nil {
+				lastErr = nil
+				break
+			}
+			lastErr = err
+			log.Printf("session %d attempt %d failed: %v", sessionNum, attempt, err)
+			if attempt < retries {
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		if lastErr != nil {
+			log.Printf("=== session %d gave up after %d attempts: %v ===", sessionNum, retries, lastErr)
+		} else {
+			log.Printf("=== session %d completed ===", sessionNum)
+		}
+		if sessionNum < sessionCount {
+			gap := randomDuration(idleMin, idleMax)
+			log.Printf("=== idle gap %s before next session ===", gap)
+			time.Sleep(gap)
+		}
+	}
+	return nil
+}
+
+// runClientSession runs one allocate→DTLS→SRTP flow for the given duration.
+// On return (success or error), all resources are cleaned up.
+func runClientSession(server, secret string, peerIP net.IP, peerPort int, fpMode string, dur time.Duration) error {
 	alloc, err := turn.Allocate(turn.AllocateConfig{
 		Server:  server,
 		Secret:  secret,
@@ -200,7 +239,6 @@ func runClient(server, secret, peerStr, fpMode string) error {
 	}
 	log.Printf("client: TURN allocate + ChannelBind OK (channel=%#04x peer=%s:%d)", channelNum, peerIP, peerPort)
 
-	// Inner-layer transport: ChannelData payloads in/out of coturn.
 	relay := alloc.NewRelayConn(channelNum)
 	mux := newPacketMux(relay, "client")
 	defer mux.Close()
@@ -283,13 +321,17 @@ func runClient(server, secret, peerStr, fpMode string) error {
 	if err != nil {
 		return fmt.Errorf("create SRTP TX context: %w", err)
 	}
-	log.Printf("client: SRTP TX context ready, sending %d Opus-shaped packets...", packetsPerFlow)
 
+	// Fresh per-session SSRC + sequence + timestamp, as a real WebRTC
+	// session would. SSRC stable within a session.
 	ssrc := randUint32()
-	startTS := randUint32()
-	startSeq := uint16(randUint32() & 0xFFFF)
+	ts := randUint32()
+	seq := uint16(randUint32() & 0xFFFF)
 
-	for i := 0; i < packetsPerFlow; i++ {
+	deadline := time.Now().Add(dur)
+	log.Printf("client: SRTP TX context ready (ssrc=%#x), streaming Opus-shaped packets for %s...", ssrc, dur)
+	pktCount := 0
+	for time.Now().Before(deadline) {
 		payloadLen := 100 + (int(randUint32()) % 80)
 		payload := make([]byte, payloadLen)
 		rand.Read(payload)
@@ -297,8 +339,8 @@ func runClient(server, secret, peerStr, fpMode string) error {
 			Header: rtp.Header{
 				Version:        2,
 				PayloadType:    opusPayloadType,
-				SequenceNumber: startSeq + uint16(i),
-				Timestamp:      startTS + uint32(i*opusFrameSamples),
+				SequenceNumber: seq,
+				Timestamp:      ts,
 				SSRC:           ssrc,
 			},
 			Payload: payload,
@@ -314,41 +356,73 @@ func runClient(server, secret, peerStr, fpMode string) error {
 		if _, err := mux.WriteSRTP(encrypted); err != nil {
 			return err
 		}
-		log.Printf("client: SRTP[%d] >>> seq=%d ts=%d ssrc=%#x %dB (encrypted=%dB)",
-			i, pkt.SequenceNumber, pkt.Timestamp, pkt.SSRC, len(payload), len(encrypted))
+		seq++
+		ts += uint32(opusFrameSamples)
+		pktCount++
 		time.Sleep(time.Duration(opusFrameMs) * time.Millisecond)
 	}
-	log.Printf("client: all %d SRTP packets sent.", packetsPerFlow)
+	log.Printf("client: session sent %d SRTP packets in %s (~%.0f pps)", pktCount, dur, float64(pktCount)/dur.Seconds())
 
-	time.Sleep(500 * time.Millisecond)
+	// Brief grace before tearing down so egress can drain. In a real
+	// production teardown the client would also send a Refresh with
+	// LIFETIME=0 to release the allocation cleanly; here we just close
+	// the UDP socket and let the allocation expire.
+	time.Sleep(200 * time.Millisecond)
 	return nil
 }
 
 // ----------------------------------------------------------------------------
-// Egress subcommand: raw UDP listener → DTLS server → SRTP receiver.
+// Egress subcommand: accepts a series of sessions back-to-back, each
+// starting on the first packet from a new source UDP port (a new
+// coturn relay address allocated for a fresh client session).
+//
+// Architecture: ONE central reader goroutine drains the shared
+// net.PacketConn and demuxes packets to per-session-source channels.
+// Each session's mux pulls its own packets from a channel rather than
+// racing the underlying socket. This is the standard
+// listener-with-many-sessions pattern (also what pion/dtls.Listen()
+// does internally).
 // ----------------------------------------------------------------------------
 
-func runEgress(listen string) error {
+func runEgress(listen string, sessionCount int) error {
 	pc, err := net.ListenPacket("udp", listen)
 	if err != nil {
 		return fmt.Errorf("listen UDP %s: %w", listen, err)
 	}
-	log.Printf("egress: listening on %s, waiting for first packet...", listen)
+	defer pc.Close()
+	log.Printf("egress: listening on %s, will accept %d sessions...", listen, sessionCount)
 
-	buf := make([]byte, 4096)
-	pc.SetReadDeadline(time.Time{})
-	n, srcAddr, err := pc.ReadFrom(buf)
-	if err != nil {
-		return fmt.Errorf("read first packet: %w", err)
-	}
-	log.Printf("egress: first packet from %s (%dB, leading=%#02x)", srcAddr, n, buf[0])
+	demux := newEgressDemuxer(pc)
+	defer demux.Close()
 
-	ssconn := &singleSourceConn{
-		pc:         pc,
-		remoteAddr: srcAddr,
-		firstPkt:   append([]byte{}, buf[:n]...),
+	for sessionNum := 1; sessionNum <= sessionCount; sessionNum++ {
+		log.Printf("=== egress session %d/%d waiting for first packet ===", sessionNum, sessionCount)
+		ev, ok := demux.NextSession()
+		if !ok {
+			return fmt.Errorf("demuxer closed before session %d", sessionNum)
+		}
+		log.Printf("egress: first packet from %s (%dB, leading=%#02x)", ev.addr, len(ev.firstPkt), ev.firstPkt[0])
+		if err := runEgressSession(pc, demux, ev); err != nil {
+			log.Printf("egress session %d failed: %v", sessionNum, err)
+		} else {
+			log.Printf("=== egress session %d completed ===", sessionNum)
+		}
 	}
-	mux := newPacketMux(ssconn, "egress")
+	return nil
+}
+
+// runEgressSession handles one client session: wraps the demuxer's
+// per-source channel as a net.Conn, runs DTLS server + SRTP receive,
+// returns when peer goes silent.
+func runEgressSession(pc net.PacketConn, demux *egressDemuxer, ev *sessionEvent) error {
+	defer demux.endSession(ev.addr)
+
+	sconn := &sessionConn{
+		rxCh: ev.rxCh,
+		pc:   pc,
+		addr: ev.addr,
+	}
+	mux := newPacketMux(sconn, "egress")
 	defer mux.Close()
 
 	cert, err := selfsign.GenerateSelfSigned()
@@ -363,7 +437,7 @@ func runEgress(listen string) error {
 	}
 	log.Printf("egress: starting DTLS server handshake...")
 	t0 := time.Now()
-	dtlsConn, err := dtls.Server(mux.DTLSPacketConn(srcAddr), srcAddr, dtlsCfg)
+	dtlsConn, err := dtls.Server(mux.DTLSPacketConn(ev.addr), ev.addr, dtlsCfg)
 	if err != nil {
 		return fmt.Errorf("DTLS Server setup: %w", err)
 	}
@@ -373,12 +447,6 @@ func runEgress(listen string) error {
 	}
 	log.Printf("egress: DTLS handshake OK in %s", time.Since(t0))
 
-	profile, ok := dtlsConn.SelectedSRTPProtectionProfile()
-	if !ok {
-		return fmt.Errorf("no SRTP profile negotiated")
-	}
-	log.Printf("egress: negotiated SRTP profile: %#x", uint16(profile))
-
 	state, ok2 := dtlsConn.ConnectionState()
 	if !ok2 {
 		return fmt.Errorf("connection state not available")
@@ -387,34 +455,31 @@ func runEgress(listen string) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("egress: extracted %d bytes of SRTP keying material", len(keyMat))
 
 	clientWriteKey, clientWriteSalt, _, _ := splitSRTPKeys(keyMat)
 	rxCtx, err := srtp.CreateContext(clientWriteKey, clientWriteSalt, srtpProfile)
 	if err != nil {
 		return err
 	}
-	log.Printf("egress: SRTP RX context ready, listening for packets...")
+	log.Printf("egress: SRTP RX context ready, receiving packets until peer goes silent...")
 
 	rxBuf := make([]byte, 4096)
-	for i := 0; i < packetsPerFlow; i++ {
-		mux.srtpReadDeadline(time.Now().Add(5 * time.Second))
+	pktCount := 0
+	for {
+		// 2-second silence threshold marks session end.
+		mux.srtpReadDeadline(time.Now().Add(2 * time.Second))
 		n, err := mux.ReadSRTP(rxBuf)
 		if err != nil {
-			return err
+			break
 		}
-		decrypted, err := rxCtx.DecryptRTP(nil, rxBuf[:n], nil)
+		_, err = rxCtx.DecryptRTP(nil, rxBuf[:n], nil)
 		if err != nil {
-			return err
+			log.Printf("egress: decrypt err pkt %d: %v", pktCount, err)
+			continue
 		}
-		pkt := &rtp.Packet{}
-		if err := pkt.Unmarshal(decrypted); err != nil {
-			return err
-		}
-		log.Printf("egress: SRTP[%d] <<< seq=%d ts=%d ssrc=%#x PT=%d %dB (encrypted=%dB)",
-			i, pkt.SequenceNumber, pkt.Timestamp, pkt.SSRC, pkt.PayloadType, len(pkt.Payload), n)
+		pktCount++
 	}
-	log.Printf("egress: received all %d SRTP packets.", packetsPerFlow)
+	log.Printf("egress: session received %d SRTP packets", pktCount)
 	return nil
 }
 
@@ -584,52 +649,130 @@ func (dummyAddr) Network() string { return "muxed" }
 func (dummyAddr) String() string  { return "muxed" }
 
 // ----------------------------------------------------------------------------
-// singleSourceConn — wrap a net.PacketConn as a net.Conn pinned to one peer.
-// The first packet that arrived (passed in) is replayed on the first Read.
+// egressDemuxer — single shared reader over net.PacketConn; routes
+// packets to per-source-address channels. Necessary so multiple
+// sequential sessions on the same listener don't race each other.
 // ----------------------------------------------------------------------------
 
-type singleSourceConn struct {
-	pc         net.PacketConn
-	remoteAddr net.Addr
-
-	mu       sync.Mutex
+type sessionEvent struct {
+	addr     net.Addr
 	firstPkt []byte
-	consumed bool
+	rxCh     chan []byte
 }
 
-func (c *singleSourceConn) Read(p []byte) (int, error) {
-	c.mu.Lock()
-	if !c.consumed && len(c.firstPkt) > 0 {
-		n := copy(p, c.firstPkt)
-		c.consumed = true
-		c.mu.Unlock()
-		return n, nil
-	}
-	c.mu.Unlock()
+type egressDemuxer struct {
+	pc        net.PacketConn
+	sessions  sync.Map // addr.String() -> chan []byte
+	newSess   chan *sessionEvent
+	closeOnce sync.Once
+	closed    chan struct{}
+}
 
+func newEgressDemuxer(pc net.PacketConn) *egressDemuxer {
+	d := &egressDemuxer{
+		pc:      pc,
+		newSess: make(chan *sessionEvent, 4),
+		closed:  make(chan struct{}),
+	}
+	go d.run()
+	return d
+}
+
+func (d *egressDemuxer) run() {
 	for {
 		buf := make([]byte, 4096)
-		n, addr, err := c.pc.ReadFrom(buf)
+		n, addr, err := d.pc.ReadFrom(buf)
 		if err != nil {
-			return 0, err
+			d.Close()
+			return
 		}
-		if addr.String() != c.remoteAddr.String() {
+		pkt := append([]byte(nil), buf[:n]...)
+		key := addr.String()
+		if v, ok := d.sessions.Load(key); ok {
+			ch := v.(chan []byte)
+			select {
+			case ch <- pkt:
+			default:
+				// drop on full — pacing is sufficient that
+				// this shouldn't fire in practice
+			}
 			continue
 		}
-		return copy(p, buf[:n]), nil
+		// New session.
+		ch := make(chan []byte, 64)
+		d.sessions.Store(key, ch)
+		ch <- pkt // first packet
+		select {
+		case d.newSess <- &sessionEvent{addr: addr, firstPkt: pkt, rxCh: ch}:
+		case <-d.closed:
+			return
+		}
 	}
 }
 
-func (c *singleSourceConn) Write(p []byte) (int, error) {
-	return c.pc.WriteTo(p, c.remoteAddr)
+func (d *egressDemuxer) NextSession() (*sessionEvent, bool) {
+	select {
+	case ev, ok := <-d.newSess:
+		return ev, ok
+	case <-d.closed:
+		return nil, false
+	}
 }
 
-func (c *singleSourceConn) Close() error                       { return c.pc.Close() }
-func (c *singleSourceConn) LocalAddr() net.Addr                { return c.pc.LocalAddr() }
-func (c *singleSourceConn) RemoteAddr() net.Addr               { return c.remoteAddr }
-func (c *singleSourceConn) SetDeadline(t time.Time) error      { return c.pc.SetDeadline(t) }
-func (c *singleSourceConn) SetReadDeadline(t time.Time) error  { return c.pc.SetReadDeadline(t) }
-func (c *singleSourceConn) SetWriteDeadline(t time.Time) error { return c.pc.SetWriteDeadline(t) }
+func (d *egressDemuxer) endSession(addr net.Addr) {
+	if v, ok := d.sessions.LoadAndDelete(addr.String()); ok {
+		close(v.(chan []byte))
+	}
+}
+
+func (d *egressDemuxer) Close() error {
+	d.closeOnce.Do(func() {
+		close(d.closed)
+	})
+	return nil
+}
+
+// sessionConn wraps the demuxer's per-session channel as an
+// io.ReadWriteCloser for packetMux. Reads pull from rxCh; writes go
+// out via pc.WriteTo. Close drops the channel reference (the
+// underlying pc is shared and outlives any single session).
+type sessionConn struct {
+	rxCh chan []byte
+	pc   net.PacketConn
+	addr net.Addr
+
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func (c *sessionConn) Read(p []byte) (int, error) {
+	if c.closed == nil {
+		c.closed = make(chan struct{})
+	}
+	select {
+	case pkt, ok := <-c.rxCh:
+		if !ok {
+			return 0, io.EOF
+		}
+		return copy(p, pkt), nil
+	case <-c.closed:
+		return 0, io.EOF
+	}
+}
+
+func (c *sessionConn) Write(p []byte) (int, error) {
+	return c.pc.WriteTo(p, c.addr)
+}
+
+func (c *sessionConn) Close() error {
+	c.closeOnce.Do(func() {
+		if c.closed == nil {
+			c.closed = make(chan struct{})
+		}
+		close(c.closed)
+	})
+	return nil
+}
 
 // ----------------------------------------------------------------------------
 // helpers
@@ -660,6 +803,16 @@ func randUint32() uint32 {
 	var b [4]byte
 	rand.Read(b[:])
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+// randomDuration picks a uniformly random duration in [min, max].
+func randomDuration(min, max time.Duration) time.Duration {
+	if max <= min {
+		return min
+	}
+	span := max - min
+	r := time.Duration(randUint32()) % span
+	return min + r
 }
 
 func usage() {
