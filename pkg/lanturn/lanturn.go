@@ -46,6 +46,7 @@ import (
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/rtp"
 	"github.com/pion/srtp/v3"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 // ============================================================================
@@ -152,14 +153,27 @@ const (
 // Dial — client-side
 // ============================================================================
 
-// Dial opens a lanturn client connection. The returned net.Conn carries
-// caller bytes through the full lanturn stack: caller bytes →
-// SRTP-paced chunks (Opus profile, 50pps) → AES-128-CM-HMAC-SHA1-80
-// encryption → DTLS-derived keying → TURN ChannelData → plain UDP/3478.
+// Dial opens a lanturn client connection toward `destination`. The
+// returned net.Conn carries caller bytes through the full lanturn
+// stack: caller bytes → SRTP-paced chunks (Opus profile, 50pps) →
+// AES-128-CM-HMAC-SHA1-80 encryption → DTLS-derived keying → TURN
+// ChannelData → plain UDP/3478.
+//
+// Destination forwarding: the first bytes the egress receives are
+// `M.SocksaddrSerializer.WriteAddrPort(destination)` — the sing-box-
+// native address-prefix pattern used by trojan / anytls / vmess /
+// shadowsocks (NOT a full SOCKS5 handshake, which is heavier and only
+// used when the egress is a generic SOCKS5 server like in Unbounded).
+// The egress reads the prefix in `Listener.Accept` and dials the
+// destination itself; from the caller's perspective the returned conn
+// is a transparent byte pipe to `destination`.
 //
 // MVP: single session, UDP-only, Opus-only profile. Caller redials
 // to start a fresh session.
-func Dial(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
+func Dial(ctx context.Context, cfg ClientConfig, destination M.Socksaddr) (net.Conn, error) {
+	if !destination.IsValid() {
+		return nil, fmt.Errorf("lanturn: invalid destination %s", destination)
+	}
 	if len(cfg.CoturnEndpoints) == 0 {
 		return nil, fmt.Errorf("lanturn: no coturn endpoints configured")
 	}
@@ -270,22 +284,47 @@ func Dial(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 		return nil, fmt.Errorf("lanturn: SRTP TX context: %w", err)
 	}
 
+	// Encode the destination prefix that the egress will read first.
+	// Sing-box-native serializer matches what trojan / anytls / vmess /
+	// shadowsocks use — 1B address-type + addr + 2B port, no SOCKS5
+	// ceremony.
+	prefix := encodeDestination(destination)
+
 	// Build the streaming-chunker on top of the SRTP context.
-	conn := newClientConn(ctx, mux, txCtx, alloc, dtlsConn, logf)
+	conn := newClientConn(ctx, mux, txCtx, alloc, dtlsConn, logf, prefix)
 	return conn, nil
+}
+
+// encodeDestination produces the M.SocksaddrSerializer wire format for
+// the given destination — the prefix the egress reads first.
+func encodeDestination(dst M.Socksaddr) []byte {
+	buf := make([]byte, 0, M.SocksaddrSerializer.AddrPortLen(dst))
+	w := bytesWriter{buf: &buf}
+	_ = M.SocksaddrSerializer.WriteAddrPort(&w, dst)
+	return buf
+}
+
+type bytesWriter struct{ buf *[]byte }
+
+func (w *bytesWriter) Write(p []byte) (int, error) {
+	*w.buf = append(*w.buf, p...)
+	return len(p), nil
 }
 
 // ============================================================================
 // Listen — server-side (Lantern egress)
 // ============================================================================
 
-// Listen opens a lanturn server listener. Each Accept returns a
-// net.Conn for one inbound client session.
+// Listen opens a lanturn server listener. The returned *Listener's
+// Accept blocks until a new client session arrives and returns the
+// per-session net.Conn along with the destination the client wants
+// traffic forwarded to (read from the M.SocksaddrSerializer prefix
+// the client sends as the first inner-stream bytes).
 //
 // MVP: accepts one session at a time (sequential). Production would
 // concurrently accept multiple via the egressDemuxer pattern from
 // cmd/lanturn-phase2/main.go.
-func Listen(cfg ServerConfig) (net.Listener, error) {
+func Listen(cfg ServerConfig) (*Listener, error) {
 	if cfg.ListenUDP == "" {
 		return nil, fmt.Errorf("lanturn: ListenUDP required")
 	}
@@ -297,22 +336,35 @@ func Listen(cfg ServerConfig) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("lanturn: ListenPacket: %w", err)
 	}
-	return &listener{pc: pc, logf: logf, closed: make(chan struct{})}, nil
+	return &Listener{pc: pc, logf: logf, closed: make(chan struct{})}, nil
 }
 
-type listener struct {
+// Listener is the egress-side accept loop for lanturn client sessions.
+// Note that this is NOT a net.Listener — Accept returns three values
+// (conn, destination, err) so the egress process can dial the
+// destination itself before bridging bytes. lanturn's egress is not a
+// generic listener-pattern consumer; it's specifically the
+// "address-prefix + io.Copy" SOCKS-shaped proxy described in the
+// design doc §4.
+type Listener struct {
 	pc        net.PacketConn
 	logf      func(format string, args ...any)
 	closeOnce sync.Once
 	closed    chan struct{}
 }
 
-func (l *listener) Accept() (net.Conn, error) {
+// Accept blocks until a new lanturn client session arrives, runs the
+// inner DTLS-SRTP handshake, reads the destination prefix the client
+// sends per M.SocksaddrSerializer, and returns the session conn + the
+// destination + nil error. The egress is expected to immediately dial
+// `destination` (via whatever direct dialer it's configured with) and
+// io.Copy bidirectionally between that dial and the returned conn.
+func (l *Listener) Accept() (net.Conn, M.Socksaddr, error) {
 	// Wait for first packet from a new source — this initiates a session.
 	buf := make([]byte, 4096)
 	n, srcAddr, err := l.pc.ReadFrom(buf)
 	if err != nil {
-		return nil, err
+		return nil, M.Socksaddr{}, err
 	}
 	l.logf("lanturn: accepting session from %s (first pkt %dB leading=%#02x)", srcAddr, n, buf[0])
 
@@ -324,7 +376,7 @@ func (l *listener) Accept() (net.Conn, error) {
 	cert, err := selfsign.GenerateSelfSigned()
 	if err != nil {
 		mux.Close()
-		return nil, fmt.Errorf("lanturn: cert: %w", err)
+		return nil, M.Socksaddr{}, fmt.Errorf("lanturn: cert: %w", err)
 	}
 	dtlsCfg := &dtls.Config{
 		Certificates:           []tls.Certificate{cert},
@@ -335,12 +387,12 @@ func (l *listener) Accept() (net.Conn, error) {
 	dtlsConn, err := dtls.Server(mux.dtlsPacketConn(srcAddr), srcAddr, dtlsCfg)
 	if err != nil {
 		mux.Close()
-		return nil, fmt.Errorf("lanturn: DTLS server setup: %w", err)
+		return nil, M.Socksaddr{}, fmt.Errorf("lanturn: DTLS server setup: %w", err)
 	}
 	if err := dtlsConn.Handshake(); err != nil {
 		dtlsConn.Close()
 		mux.Close()
-		return nil, fmt.Errorf("lanturn: DTLS handshake: %w", err)
+		return nil, M.Socksaddr{}, fmt.Errorf("lanturn: DTLS handshake: %w", err)
 	}
 	l.logf("lanturn: inner DTLS handshake OK")
 
@@ -348,27 +400,40 @@ func (l *listener) Accept() (net.Conn, error) {
 	if !ok {
 		dtlsConn.Close()
 		mux.Close()
-		return nil, fmt.Errorf("lanturn: no DTLS connection state")
+		return nil, M.Socksaddr{}, fmt.Errorf("lanturn: no DTLS connection state")
 	}
 	keyMat, err := state.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, srtpKeyMatLen)
 	if err != nil {
 		dtlsConn.Close()
 		mux.Close()
-		return nil, fmt.Errorf("lanturn: ExportKeyingMaterial: %w", err)
+		return nil, M.Socksaddr{}, fmt.Errorf("lanturn: ExportKeyingMaterial: %w", err)
 	}
 	clientKey, clientSalt, _, _ := splitSRTPKeys(keyMat)
 	rxCtx, err := srtp.CreateContext(clientKey, clientSalt, srtpProfile)
 	if err != nil {
 		dtlsConn.Close()
 		mux.Close()
-		return nil, fmt.Errorf("lanturn: SRTP RX context: %w", err)
+		return nil, M.Socksaddr{}, fmt.Errorf("lanturn: SRTP RX context: %w", err)
 	}
 
 	conn := newServerConn(mux, rxCtx, dtlsConn, l.logf)
-	return conn, nil
+
+	// Read the destination prefix the client sent as the first bytes
+	// of the inner stream (M.SocksaddrSerializer). Times out if the
+	// client doesn't send it promptly — that's a malformed session.
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	destination, err := M.SocksaddrSerializer.ReadAddrPort(conn)
+	if err != nil {
+		conn.Close()
+		return nil, M.Socksaddr{}, fmt.Errorf("lanturn: read destination prefix: %w", err)
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	l.logf("lanturn: session destination = %s", destination)
+
+	return conn, destination, nil
 }
 
-func (l *listener) Close() error {
+func (l *Listener) Close() error {
 	l.closeOnce.Do(func() {
 		close(l.closed)
 		l.pc.Close()
@@ -376,7 +441,7 @@ func (l *listener) Close() error {
 	return nil
 }
 
-func (l *listener) Addr() net.Addr {
+func (l *Listener) Addr() net.Addr {
 	return l.pc.LocalAddr()
 }
 
@@ -423,6 +488,12 @@ type clientConn struct {
 
 	writeBuf chan []byte // bounded buffer of pending caller bytes
 
+	// destinationPrefix is the M.SocksaddrSerializer wire-encoded
+	// destination address that the egress reads first. The txLoop
+	// seeds its `pending` buffer with these bytes before any caller
+	// writes drain in.
+	destinationPrefix []byte
+
 	// rxPipe is the byte stream the caller reads from. Filled by a
 	// goroutine reading SRTP packets, draining real-data payloads.
 	rxPipe *bytesPipe
@@ -432,7 +503,7 @@ type clientConn struct {
 	rxCtx     *srtp.Context
 }
 
-func newClientConn(ctx context.Context, mux *packetMux, txCtx *srtp.Context, alloc *turn.Allocation, dtlsConn *dtls.Conn, logf func(format string, args ...any)) *clientConn {
+func newClientConn(ctx context.Context, mux *packetMux, txCtx *srtp.Context, alloc *turn.Allocation, dtlsConn *dtls.Conn, logf func(format string, args ...any), destinationPrefix []byte) *clientConn {
 	// We'll need an RX SRTP context to decrypt the egress's responses.
 	// Egress side derives keys with the SAME EXTRACTOR layout; the
 	// "server write" half of our extracted keying material is the
@@ -444,17 +515,18 @@ func newClientConn(ctx context.Context, mux *packetMux, txCtx *srtp.Context, all
 
 	cctx, cancel := context.WithCancel(ctx)
 	c := &clientConn{
-		ctx:      cctx,
-		cancel:   cancel,
-		mux:      mux,
-		txCtx:    txCtx,
-		rxCtx:    rxCtx,
-		alloc:    alloc,
-		dtlsConn: dtlsConn,
-		logf:     logf,
-		writeBuf: make(chan []byte, 64),
-		rxPipe:   newBytesPipe(),
-		closed:   make(chan struct{}),
+		ctx:               cctx,
+		cancel:            cancel,
+		mux:               mux,
+		txCtx:             txCtx,
+		rxCtx:             rxCtx,
+		alloc:             alloc,
+		dtlsConn:          dtlsConn,
+		logf:              logf,
+		writeBuf:          make(chan []byte, 64),
+		rxPipe:            newBytesPipe(),
+		closed:            make(chan struct{}),
+		destinationPrefix: destinationPrefix,
 	}
 	go c.txLoop()
 	go c.rxLoop()
@@ -467,7 +539,10 @@ func (c *clientConn) txLoop() {
 	ts := randUint32()
 	seq := uint16(randUint32() & 0xFFFF)
 
-	pending := make([]byte, 0, 4096)
+	// Seed pending with the destination prefix so the very first
+	// real-data bytes the egress receives are the serialized address.
+	pending := make([]byte, 0, 4096+len(c.destinationPrefix))
+	pending = append(pending, c.destinationPrefix...)
 	ticker := time.NewTicker(opusFrameMs * time.Millisecond)
 	defer ticker.Stop()
 

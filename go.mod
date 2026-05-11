@@ -19,6 +19,7 @@ require (
 	github.com/pion/transport/v2 v2.2.4 // indirect
 	github.com/pion/transport/v3 v3.0.2 // indirect
 	github.com/pion/transport/v4 v4.0.1 // indirect
+	github.com/sagernet/sing v0.8.9 // indirect
 	github.com/theodorsm/covert-dtls v1.5.0 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/net v0.47.0 // indirect
